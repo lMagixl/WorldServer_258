@@ -1,0 +1,1603 @@
+using System.Collections.Concurrent;
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using MySqlConnector;
+
+var configPath = Path.Combine(AppContext.BaseDirectory, "worldserver.ini");
+var config = WorldServerConfig.Load(configPath);
+
+Console.Title = "Rakion WorldServer Emulator";
+Console.WriteLine("========================================");
+Console.WriteLine(" Rakion WorldServer Emulator (C#)");
+Console.WriteLine("========================================");
+Console.WriteLine($" Config : {configPath}");
+Console.WriteLine($" TCP    : {config.Bind}:{config.Port}");
+Console.WriteLine($" UDP    : {config.Bind}:{config.UdpPort1}, {config.Bind}:{config.UdpPort2}");
+Console.WriteLine($" Broker : {config.BrokerIp}:{config.BrokerPort}");
+Console.WriteLine($" DB     : {config.DatabaseUser}@{config.DatabaseHost}:{config.DatabasePort}/{config.DatabaseName}");
+Console.WriteLine("========================================");
+
+var databaseOk = await TestDatabaseAsync(config);
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+var sessions = new ConcurrentDictionary<int, TcpClient>();
+var loginSessions = new ConcurrentDictionary<int, LoginSession>();
+
+// Omitido para inyectarlo en UDP directamente
+
+var tasks = new[]
+{
+    RunTcpServerAsync(config, sessions, loginSessions, cts.Token),
+    RunUdpEchoServerAsync(config, config.UdpPort1, cts.Token),
+    RunUdpEchoServerAsync(config, config.UdpPort2, cts.Token)
+};
+
+Console.WriteLine("Server is running. Press ENTER to stop.");
+_ = Task.Run(() => { Console.ReadLine(); cts.Cancel(); });
+
+try { await Task.WhenAll(tasks); }
+catch (OperationCanceledException) { }
+catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+{
+    Console.WriteLine($"ERROR: puerto ocupado. Cierra otro WorldServer. Detalle: {ex.Message}");
+}
+catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressNotAvailable)
+{
+    Console.WriteLine($"ERROR: la IP {config.Bind} no existe en esta PC/VM. Cambia Bind en worldserver.ini. Detalle: {ex.Message}");
+}
+
+Console.WriteLine("Server stopped.");
+
+// ==================== DATABASE ====================
+
+static async Task<bool> TestDatabaseAsync(WorldServerConfig config)
+{
+    var builder = new MySqlConnectionStringBuilder
+    {
+        Server = config.DatabaseHost,
+        Port = (uint)config.DatabasePort,
+        UserID = config.DatabaseUser,
+        Password = config.DatabasePassword,
+        Database = config.DatabaseName,
+        CharacterSet = "utf8",
+        AllowUserVariables = true,
+        SslMode = MySqlSslMode.Disabled,
+        ConnectionProtocol = MySqlConnectionProtocol.Tcp
+    };
+
+    try
+    {
+        await using var connection = new MySqlConnection(builder.ConnectionString);
+        await connection.OpenAsync();
+        Console.WriteLine("DB OK: conexion abierta correctamente.");
+
+        // AUTO-LIMPIEZA DE SLOTS DUPLICADOS
+        try
+        {
+            await using var cleanCmd = connection.CreateCommand();
+            cleanCmd.CommandText = @"
+                UPDATE characterinfo c1
+                JOIN characterinfo c2 ON c1.userid = c2.userid AND c1.slot = c2.slot AND c1.id > c2.id
+                SET c1.auth = 10, c1.used = 0
+                WHERE IFNULL(c1.auth,0) <> 10 AND IFNULL(c2.auth,0) <> 10;";
+            int deleted = await cleanCmd.ExecuteNonQueryAsync();
+            if (deleted > 0)
+            {
+                Console.WriteLine($"DB CLEANUP: Se eliminaron {deleted} personajes bugeados (compartian el mismo slot).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"DB CLEANUP WARNING: No se pudo auto-limpiar los slots: {ex.Message}");
+        }
+
+        return true;
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"DB ERROR: {ex.Message}");
+        Console.WriteLine("El servidor puede abrir puertos, pero login real necesitara MySQL funcionando.");
+        return false;
+    }
+}
+
+static string BuildConnectionString(WorldServerConfig config)
+{
+    var builder = new MySqlConnectionStringBuilder
+    {
+        Server = config.DatabaseHost,
+        Port = (uint)config.DatabasePort,
+        UserID = config.DatabaseUser,
+        Password = config.DatabasePassword,
+        Database = config.DatabaseName,
+        CharacterSet = "utf8",
+        AllowUserVariables = true,
+        SslMode = MySqlSslMode.Disabled,
+        ConnectionProtocol = MySqlConnectionProtocol.Tcp
+    };
+    return builder.ConnectionString;
+}
+
+static string GetUserGameInfoSelectSql() =>
+    "SELECT ugi.id, IFNULL(ugi.gold,2000000), IFNULL(ugi.slot,3), IFNULL(ugi.bag,1), IFNULL(c.cash,0), " +
+    "(ugi.bandate>now()), IFNULL(ugi.clanid,0), IFNULL(ugi.clanpoint,0), IFNULL(ugi.clanrank,0), IFNULL(ugi.buddyname,''), " +
+    "IFNULL(ugi.powertime,0), IFNULL(ugi.powerlevelpoint,0), IFNULL(ugi.ban,0), IFNULL(ugi.charname,''), IFNULL(ugi.treeuppername,''), " +
+    "IFNULL(ugi.treerank,0), (ugi.createtime=0), IFNULL(ugi.tutorial,1) " +
+    "FROM UserGameInfo ugi LEFT JOIN Cash c ON ugi.name=c.id WHERE ugi.name=@name " +
+    "ORDER BY (SELECT COUNT(*) FROM characterinfo ci WHERE ci.userid=ugi.id AND IFNULL(ci.auth,0)<>10) DESC, ugi.id ASC LIMIT 1";
+
+static async Task<List<CharInfo>> QueryCharactersAsync(MySqlConnection connection, uint userId, CancellationToken token)
+{
+    var list = new List<CharInfo>();
+    await using var cmd = connection.CreateCommand();
+    cmd.CommandText = "SELECT slot,id,name,IFNULL(auth,0),IFNULL(class,0),IFNULL(level,1),IFNULL(exp,0),IFNULL(levelpoint,0)," +
+                      "IFNULL(hit1,0),IFNULL(hit2,0),IFNULL(hit3,0),IFNULL(hit4,0),IFNULL(chit,0),IFNULL(hp,0),IFNULL(ap,0)," +
+                      "IFNULL(attackspeed,0),IFNULL(speed,0),IFNULL(maxcp,0),IFNULL(rankgrade,0),IFNULL(win,0),IFNULL(lose,0)," +
+                      "IFNULL(draw,0),IFNULL(totalrank,0),IFNULL(classrank,0),IFNULL(potionslot,0) " +
+                      "FROM CharacterInfo WHERE userid=@uid AND IFNULL(auth,0)<>10 ORDER BY id";
+    cmd.Parameters.AddWithValue("@uid", userId);
+
+    await using (var reader = await cmd.ExecuteReaderAsync(token))
+    {
+        byte virtualSlot = 0;
+        while (await reader.ReadAsync(token))
+        {
+            var ch = new CharInfo(
+                Convert.ToUInt32(reader[1]),
+                reader.GetString(2),
+                virtualSlot++, // Bypass: Asigna el slot en memoria ignorando el de la BD que esté corrupto
+                Convert.ToByte(reader[4]),
+                Convert.ToUInt16(reader[5]),
+                Convert.ToUInt32(reader[6]),
+                Convert.ToUInt16(reader[7]),
+                Convert.ToUInt16(reader[18]),
+                Convert.ToUInt32(reader[19]),
+                Convert.ToUInt32(reader[20]),
+                Convert.ToUInt32(reader[21]),
+                Convert.ToUInt16(reader[8]),
+                Convert.ToUInt16(reader[9]),
+                Convert.ToUInt16(reader[10]),
+                Convert.ToUInt16(reader[11]),
+                Convert.ToUInt16(reader[12]),
+                Convert.ToUInt16(reader[13]),
+                Convert.ToUInt16(reader[14]),
+                Convert.ToUInt16(reader[15]),
+                Convert.ToUInt16(reader[16]),
+                Convert.ToUInt16(reader[17]),
+                Convert.ToUInt32(reader[22]),
+                Convert.ToUInt32(reader[23]),
+                Convert.ToByte(reader[24])
+            );
+            Console.WriteLine($"CHARLOAD: id={ch.Id} name='{ch.Name}' slot={ch.Slot} class={ch.Class} level={ch.Level} rank={ch.RankGrade} win={ch.Wins} lose={ch.Losses} draw={ch.Draws}");
+            list.Add(ch);
+        }
+    }
+
+    if (list.Count > 0)
+    {
+        await using var cmdItems = connection.CreateCommand();
+        cmdItems.CommandText = "SELECT characterid, slot, id, itemid, IFNULL(level,1), IFNULL(exp,0), IFNULL(limittime,0) FROM useriteminfo WHERE userid=@uid AND characterid>0 AND slot < 19";
+        cmdItems.Parameters.AddWithValue("@uid", userId);
+        await using var readerItems = await cmdItems.ExecuteReaderAsync(token);
+        while (await readerItems.ReadAsync(token))
+        {
+            var cid = Convert.ToUInt32(readerItems[0]);
+            var s = Convert.ToInt32(readerItems[1]);
+            
+            var targetChar = list.FirstOrDefault(c => c.Id == cid);
+            if (targetChar != null && s >= 0 && s < 19)
+            {
+                targetChar.Items[s] = new EquipItem(
+                    Convert.ToUInt32(readerItems[2]),
+                    Convert.ToInt32(readerItems[3]),
+                    Convert.ToUInt32(readerItems[4]),
+                    Convert.ToUInt32(readerItems[5]),
+                    Convert.ToByte(readerItems[6])
+                );
+            }
+        }
+    }
+
+    return list;
+}
+
+static async Task<List<CharInfo>> LoadCharactersForSessionAsync(WorldServerConfig config, LoginSession session, CancellationToken token)
+{
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+        return await QueryCharactersAsync(connection, session.UserGameId, token);
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"LOBBY_REFRESH: DB ERROR {ex.Message}");
+        return new List<CharInfo>();
+    }
+}
+
+// ==================== TCP SERVER ====================
+
+static async Task RunTcpServerAsync(WorldServerConfig config, ConcurrentDictionary<int, TcpClient> sessions, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    var endpoint = new IPEndPoint(IPAddress.Any, config.Port);
+    var listener = new TcpListener(endpoint);
+    listener.Start(config.MaxUser);
+    Console.WriteLine($"TCP LISTEN: 0.0.0.0:{config.Port}");
+
+    var nextSessionId = 1;
+    while (!token.IsCancellationRequested)
+    {
+        var client = await listener.AcceptTcpClientAsync(token);
+        var sessionId = Interlocked.Increment(ref nextSessionId);
+        sessions[sessionId] = client;
+        _ = Task.Run(() => HandleTcpClientAsync(config, sessionId, client, sessions, loginSessions, token), token);
+    }
+}
+
+static async Task HandleTcpClientAsync(WorldServerConfig config, int sessionId, TcpClient client, ConcurrentDictionary<int, TcpClient> sessions, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+    Console.WriteLine($"TCP ACCEPT #{sessionId}: {remote}");
+
+    try
+    {
+        await using var stream = client.GetStream();
+        var lenBuf = new byte[2];
+        while (!token.IsCancellationRequested)
+        {
+            if (!await TryReadExactlyAsync(stream, lenBuf, token)) break;
+            var frameLen = BinaryPrimitives.ReadUInt16LittleEndian(lenBuf);
+            if (frameLen < 2)
+            {
+                Console.WriteLine($"TCP RX #{sessionId}: bad frameLen={frameLen}, closing");
+                break;
+            }
+            var frame = new byte[frameLen];
+            lenBuf.CopyTo(frame, 0);
+            if (frameLen > 2)
+                await stream.ReadExactlyAsync(frame.AsMemory(2), token);
+            await ProcessFrameAsync(config, sessionId, stream, frame, loginSessions, token);
+        }
+    }
+    catch (IOException) { }
+    catch (SocketException) { }
+    finally
+    {
+        sessions.TryRemove(sessionId, out _);
+        loginSessions.TryRemove(sessionId, out _);
+        client.Dispose();
+        Console.WriteLine($"TCP CLOSE #{sessionId}: {remote}");
+    }
+}
+
+static async Task<bool> TryReadExactlyAsync(NetworkStream stream, byte[] buffer, CancellationToken token)
+{
+    var total = 0;
+    while (total < buffer.Length)
+    {
+        var read = await stream.ReadAsync(buffer.AsMemory(total), token);
+        if (read == 0) return false;
+        total += read;
+    }
+    return true;
+}
+
+// ==================== UDP SERVER ====================
+
+static async Task RunUdpEchoServerAsync(WorldServerConfig config, int port, CancellationToken token)
+{
+    using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+    Console.WriteLine($"UDP LISTEN: 0.0.0.0:{port}");
+
+    if (port == config.UdpPort1)
+    {
+        _ = Task.Run(async () =>
+        {
+            var brokerEndpoint = new IPEndPoint(IPAddress.Parse(config.BrokerIp), config.BrokerPort);
+            var reply = new byte[15];
+            BinaryPrimitives.WriteUInt16LittleEndian(reply.AsSpan(0), 257); // 0x0101
+            reply[6] = (byte)config.ServerId;
+            BinaryPrimitives.WriteInt16LittleEndian(reply.AsSpan(7), 2000); // maxSalas
+            BinaryPrimitives.WriteInt16LittleEndian(reply.AsSpan(9), 0);    // usedSala
+            BinaryPrimitives.WriteInt16LittleEndian(reply.AsSpan(11), 1000); // maxSlots
+            BinaryPrimitives.WriteInt16LittleEndian(reply.AsSpan(13), 0);   // usedSlots
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await udp.SendAsync(reply, reply.Length, brokerEndpoint);
+                }
+                catch { }
+                await Task.Delay(5000, token);
+            }
+        }, token);
+    }
+
+    while (!token.IsCancellationRequested)
+    {
+        var packet = await udp.ReceiveAsync(token);
+        var buf = packet.Buffer;
+        
+        if (buf.Length == 7 && buf[3] == 0x00)
+        {
+            // Ping del Broker, lo ignoramos porque ya enviamos el keep-alive en background
+            continue;
+        }
+
+        Console.WriteLine($"UDP RX {port} <- {packet.RemoteEndPoint}: {buf.Length} bytes {HexPreview(buf)}");
+
+        var relay = TryBuildP2PRelayResponse(buf);
+        if (relay != null)
+        {
+            await udp.SendAsync(relay, relay.Length, packet.RemoteEndPoint);
+            Console.WriteLine($"UDP TX {port} -> {packet.RemoteEndPoint}: P2P relay 12 bytes {HexPreview(relay)}");
+        }
+        else
+        {
+            await udp.SendAsync(buf, buf.Length, packet.RemoteEndPoint);
+        }
+    }
+}
+
+static byte[]? TryBuildP2PRelayResponse(byte[] pkt)
+{
+    var token = new byte[4];
+    byte midA = 0x00, midB = 0x00;
+
+    if (pkt.Length >= 23)
+    {
+        Array.Copy(pkt, 19, token, 0, 4);
+        if (pkt[0] == 0x02)
+        {
+            midA = 0x01;
+            midB = 0x01;
+        }
+    }
+    else if (pkt.Length >= 7 && pkt[0] == 0x0D && pkt[1] == 0x03)
+    {
+        Array.Copy(pkt, 3, token, 0, 4);
+    }
+    else
+    {
+        return null;
+    }
+
+    var resp = new byte[12];
+    resp[0] = 0x01; resp[1] = 0x02;
+    resp[2] = token[0]; resp[3] = token[1]; resp[4] = token[2]; resp[5] = token[3];
+    resp[6] = midA;    resp[7] = midB;
+    resp[8] = token[0]; resp[9] = token[1]; resp[10] = token[2]; resp[11] = token[3];
+    return resp;
+}
+
+// ==================== PACKET DISPATCH ====================
+
+static async Task ProcessFrameAsync(WorldServerConfig config, int sessionId, NetworkStream stream, byte[] frame, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!RakionPacketCodec.TryDecodeClientFrame(frame, out var packet, out var error))
+    {
+        Console.WriteLine($"TCP RX #{sessionId}: frame={frame.Length} decode-error={error} data={HexPreview(frame)}");
+        return;
+    }
+
+    Console.WriteLine(
+        $"TCP RX #{sessionId}: cmd=0x{packet.Opcode:X4} {OpcodeName(packet.Opcode)} seq={packet.Sequence:X4} payload={packet.Payload.Length} frame={frame.Length} data={HexPreview(packet.Payload)}");
+
+    switch (packet.Opcode)
+    {
+        case 0x0001:
+            await SendPacketAsync(sessionId, stream, 0x0001, new byte[] { 0x00 }, token);
+            break;
+        case 0x0002:
+            await SendServerInfoAndMd5Async(config, sessionId, stream, token);
+            break;
+        case 0x000B:
+            await HandleClientMd5EchoAsync(config, sessionId, stream, packet, token);
+            break;
+        case 0x000C:
+            await HandleLoginPacketAsync(config, sessionId, stream, packet, loginSessions, token);
+            break;
+        case 0x000E:
+            await SendLobbyServerInfoAsync(config, sessionId, stream, loginSessions, token);
+            break;
+        case 0x000F:
+            await HandleKeepAliveAsync(sessionId, stream, token);
+            break;
+        case 0x0012:
+            await HandleCharacterCreateAsync(config, sessionId, stream, packet, loginSessions, token);
+            break;
+        case 0x0013:
+            await HandleCharacterDeleteAsync(config, sessionId, stream, packet, loginSessions, token);
+            break;
+        case 0x0014:
+            await HandleCharacterSelectAsync(config, sessionId, stream, packet, loginSessions, token);
+            break;
+        case 0x0015:
+            await HandleCharacterNameEchoAsync(sessionId, stream, packet, token);
+            break;
+        case 0x001A:
+            await HandleTutorialCompleteAsync(config, sessionId, stream, loginSessions, token);
+            break;
+        case 0x002C:
+            await HandleInventoryEnterAsync(sessionId, stream, loginSessions, token);
+            break;
+        case 0x0036:
+            await HandleFieldListAsync(sessionId, stream, token);
+            break;
+        default:
+            Console.WriteLine($"TCP RX #{sessionId}: unhandled opcode 0x{packet.Opcode:X4}");
+            break;
+    }
+}
+
+// ==================== HANDLERS ====================
+
+static async Task HandleLoginPacketAsync(WorldServerConfig config, int sessionId, NetworkStream stream, RakionClientPacket packet, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    var username = ExtractUsernameFromPayload(packet.Payload);
+    if (string.IsNullOrEmpty(username))
+    {
+        Console.WriteLine($"LOGIN #{sessionId}: no se pudo extraer username (payload len={packet.Payload.Length} hex={HexPreview(packet.Payload)})");
+        await SendLoginErrorAsync(sessionId, stream, 0x08, token);
+        return;
+    }
+
+    Console.WriteLine($"LOGIN #{sessionId}: username='{username}'");
+
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+
+        int userGameId, gold, cash;
+        byte slotCount, bagCount;
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = GetUserGameInfoSelectSql();
+            cmd.Parameters.AddWithValue("@name", username);
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                reader.Close();
+                await using var ins = connection.CreateCommand();
+                ins.CommandText = "INSERT INTO usergameinfo (name,createtime,lastconnect,tutorial,slot,bag,gold) VALUES (@name,now(),now(),1,3,1,2000000)";
+                ins.Parameters.AddWithValue("@name", username);
+                await ins.ExecuteNonQueryAsync(token);
+
+                await using var cmd2 = connection.CreateCommand();
+                cmd2.CommandText = GetUserGameInfoSelectSql();
+                cmd2.Parameters.AddWithValue("@name", username);
+                await using var r2 = await cmd2.ExecuteReaderAsync(token);
+                if (!await r2.ReadAsync(token))
+                {
+                    Console.WriteLine($"LOGIN #{sessionId}: no se pudo crear usergameinfo para '{username}'");
+                    await SendLoginErrorAsync(sessionId, stream, 0x08, token);
+                    return;
+                }
+                userGameId = Convert.ToInt32(r2[0]);
+                gold       = Convert.ToInt32(r2[1]);
+                slotCount  = Convert.ToByte(r2[2]);
+                bagCount   = Convert.ToByte(r2[3]);
+                cash       = Convert.ToInt32(r2[4]);
+            }
+            else
+            {
+                userGameId = Convert.ToInt32(reader[0]);
+                gold       = Convert.ToInt32(reader[1]);
+                slotCount  = Convert.ToByte(reader[2]);
+                bagCount   = Convert.ToByte(reader[3]);
+                cash       = Convert.ToInt32(reader[4]);
+                reader.Close();
+                await using var upd = connection.CreateCommand();
+                upd.CommandText = "UPDATE usergameinfo SET lastconnect=now() WHERE id=@uid";
+                upd.Parameters.AddWithValue("@uid", userGameId);
+                await upd.ExecuteNonQueryAsync(token);
+            }
+        }
+
+        Console.WriteLine($"LOGIN #{sessionId}: userGameId={userGameId} gold={gold} cash={cash} slot={slotCount} bag={bagCount}");
+
+        var characters = await QueryCharactersAsync(connection, (uint)userGameId, token);
+        Console.WriteLine($"LOGIN #{sessionId}: {characters.Count} character(s) encontrados");
+
+        var loginSession = new LoginSession((uint)userGameId, username, gold, cash, slotCount, bagCount);
+        loginSessions[sessionId] = loginSession;
+        await SendLoginSuccessAsync(config, sessionId, stream, userGameId, sessionId, gold, cash, slotCount, bagCount, characters, token);
+        ScheduleLobbyFallback(config, sessionId, stream, loginSession);
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"LOGIN #{sessionId}: DB ERROR {ex.Message}");
+        await SendLoginErrorAsync(sessionId, stream, 0x0A, token);
+    }
+}
+
+static async Task SendServerInfoAndMd5Async(WorldServerConfig config, int sessionId, NetworkStream stream, CancellationToken token)
+{
+    var payload = new byte[101];
+    var off = 0;
+    payload[off++] = 0x00;
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(off), 1); off += 2;
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(off), (ushort)config.Port); off += 2;
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(off), (ushort)config.MaxUser); off += 2;
+    off += 8;
+    WriteCStrToSpan(payload.AsSpan(off), config.Md5TokenA, 33); off += 33;
+    WriteCStrToSpan(payload.AsSpan(off), config.Md5TokenB, 33); off += 33;
+    await SendPacketAsync(sessionId, stream, 0x0002, payload, token, "ServerInfoAndMd5");
+}
+
+static async Task HandleClientMd5EchoAsync(WorldServerConfig config, int sessionId, NetworkStream stream, RakionClientPacket packet, CancellationToken token)
+{
+    var payload = new byte[67];
+    payload[0] = 0x00;
+    WriteCStrToSpan(payload.AsSpan(1), config.Md5TokenA, 33);
+    WriteCStrToSpan(payload.AsSpan(34), config.Md5TokenB, 33);
+    await SendPacketAsync(sessionId, stream, 0x000B, payload, token, "ClientMd5Echo");
+}
+
+static async Task SendLobbyServerInfoAsync(WorldServerConfig config, int sessionId, NetworkStream stream, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!loginSessions.TryGetValue(sessionId, out var session)) return;
+
+    var characters = await LoadCharactersForSessionAsync(config, session, token);
+    if (characters.Count > 0)
+    {
+        await SendLoginSuccessAsync(config, sessionId, stream, (int)session.UserGameId, sessionId, session.Gold, session.Cash, session.SlotCount, session.BagCount, characters, token);
+        Console.WriteLine($"LOBBY_REFRESH #{sessionId}: {characters.Count} character(s) reenviados");
+    }
+
+    session.LobbyInfoSent = true;
+    await SendLobbyInfoPackets(config, sessionId, stream, session.UserGameId, token, "reactive");
+}
+
+static async Task HandleKeepAliveAsync(int sessionId, NetworkStream stream, CancellationToken token)
+{
+    await SendPacketAsync(sessionId, stream, 0x000F, Array.Empty<byte>(), token, "KeepAlive");
+}
+
+static async Task HandleFieldListAsync(int sessionId, NetworkStream stream, CancellationToken token)
+{
+    var payload = new byte[] { 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03 };
+    await SendPacketAsync(sessionId, stream, 0x0036, payload, token, "FieldList");
+}
+
+static async Task HandleInventoryEnterAsync(int sessionId, NetworkStream stream, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    var serverMinute = (uint)(DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60);
+    byte openCount = 4;
+    if (loginSessions.TryGetValue(sessionId, out var session))
+        openCount = session.NextInventoryOpenCount();
+
+    var payload = new byte[9];
+    payload[0] = 0x00;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), serverMinute);
+    payload[5] = 0x00;
+    payload[6] = openCount;
+    payload[7] = 0x00;
+    payload[8] = 0x12;
+    await SendPacketAsync(sessionId, stream, 0x002C, payload, token, "InventoryEnter");
+}
+
+static async Task HandleTutorialCompleteAsync(WorldServerConfig config, int sessionId, NetworkStream stream, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!loginSessions.TryGetValue(sessionId, out var session)) return;
+
+    Console.WriteLine($"TUTORIAL #{sessionId}: Registrando tutorial completado para userId={session.UserGameId}");
+
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE usergameinfo SET tutorial=1 WHERE id=@uid";
+        cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+        await cmd.ExecuteNonQueryAsync(token);
+
+        // Opcional: El servidor original no parece enviar paquete de vuelta para esto (o es un sub-opcode).
+        // En login_flow vimos "Output: [retOpcode:2][0x0E:2]" hacia el DbRecvQueue, que luego no manda nada al cliente.
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"TUTORIAL #{sessionId}: DB ERROR {ex.Message}");
+    }
+}
+
+static async Task HandleCharacterNameEchoAsync(int sessionId, NetworkStream stream, RakionClientPacket packet, CancellationToken token)
+{
+    var name = ParseFixedString(packet.Payload, 0, 13);
+    Console.WriteLine($"NAMEECHO #{sessionId}: name='{name}'");
+    await SendPacketAsync(sessionId, stream, 0x0015, BuildCharacterNameEcho(0x00, name), token, "CharacterNameEcho");
+}
+
+static async Task HandleCharacterCreateAsync(WorldServerConfig config, int sessionId, NetworkStream stream, RakionClientPacket packet, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!loginSessions.TryGetValue(sessionId, out var session))
+    {
+        Console.WriteLine($"CHARCREATE #{sessionId}: sesion no encontrada, ignorando");
+        return;
+    }
+
+    var name = ParseFixedString(packet.Payload, 0, 13);
+    ParseCharacterClassAndSlot(packet.Payload, out var charClass, out var slot);
+    Console.WriteLine($"CHARCREATE #{sessionId}: userId={session.UserGameId} name='{name}' class={charClass} slot={slot} payloadHex=[{BitConverter.ToString(packet.Payload).Replace("-", " ")}]");
+
+    if (string.IsNullOrEmpty(name))
+    {
+        await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x03 }, token, "CharacterCreate error nombre vacio");
+        return;
+    }
+
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+
+        if (!IsValidCharacterName(name))
+        {
+            await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x03 }, token, "CharacterCreate error nombre invalido");
+            return;
+        }
+
+        // 1. Validar límite de slots disponibles para el usuario
+        if (slot >= session.SlotCount)
+        {
+            await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x01 }, token, "CharacterCreate error limite de slots superado");
+            return;
+        }
+
+        // 2. Validar que el slot no esté ocupado
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM characterinfo WHERE userid=@uid AND slot=@slot AND IFNULL(auth,0)<>10";
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            cmd.Parameters.AddWithValue("@slot", slot);
+            var isOccupied = Convert.ToInt32(await cmd.ExecuteScalarAsync(token));
+            if (isOccupied > 0)
+            {
+                await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x02 }, token, "CharacterCreate error slot ocupado");
+                return;
+            }
+        }
+
+        // 3. Validar límite máximo de personajes (en caso de que intenten buguearlo enviando slots ocupados y luego libres)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM characterinfo WHERE userid=@uid AND IFNULL(auth,0)<>10";
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            var totalChars = Convert.ToInt32(await cmd.ExecuteScalarAsync(token));
+            if (totalChars >= session.SlotCount)
+            {
+                await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x03 }, token, "CharacterCreate error demasiados personajes");
+                return;
+            }
+        }
+
+        // 4. Validar nombre duplicado
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM characterinfo WHERE name=@name AND IFNULL(auth,0)<>10";
+            cmd.Parameters.AddWithValue("@name", name);
+            var exists = Convert.ToInt32(await cmd.ExecuteScalarAsync(token));
+            if (exists > 0)
+            {
+                await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x04 }, token, "CharacterCreate error nombre duplicado");
+                return;
+            }
+        }
+
+        uint charId;
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "INSERT INTO characterinfo (name,userid,class,slot,createtime,changetime) VALUES (@name,@uid,@class,@slot,now(),now())";
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            cmd.Parameters.AddWithValue("@name", name);
+            cmd.Parameters.AddWithValue("@slot", slot);
+            cmd.Parameters.AddWithValue("@class", charClass);
+            await cmd.ExecuteNonQueryAsync(token);
+            charId = (uint)cmd.LastInsertedId;
+        }
+
+        // ANTÍDOTO PARA EL TRIGGER DE MYSQL: 
+        // Forzamos el slot elegido nuevamente para evitar que un trigger de la BD lo cambie a 1 por defecto.
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "UPDATE characterinfo SET slot=@slot WHERE id=@cid";
+            cmd.Parameters.AddWithValue("@slot", slot);
+            cmd.Parameters.AddWithValue("@cid", charId);
+            await cmd.ExecuteNonQueryAsync(token);
+        }
+
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "UPDATE usergameinfo SET charname=@name WHERE IFNULL(charname,'')='' AND id=@uid";
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            cmd.Parameters.AddWithValue("@name", name);
+            await cmd.ExecuteNonQueryAsync(token);
+        }
+
+        Console.WriteLine($"CHARCREATE #{sessionId}: creado charId={charId} slot={slot}");
+        await SendPacketAsync(sessionId, stream, 0x0012, BuildCharacterCreateResponse(0x00, charId, slot, charClass), token, "CharacterCreate success");
+        await RefreshCharactersAsync(config, sessionId, stream, session, token, "CharacterCreate refresh");
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"CHARCREATE #{sessionId}: DB ERROR {ex.Message}");
+        await SendPacketAsync(sessionId, stream, 0x0012, new byte[] { 0x01 }, token, "CharacterCreate DB error");
+    }
+}
+
+static async Task HandleCharacterDeleteAsync(WorldServerConfig config, int sessionId, NetworkStream stream, RakionClientPacket packet, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!loginSessions.TryGetValue(sessionId, out var session))
+    {
+        Console.WriteLine($"CHARDELETE #{sessionId}: sesion no encontrada, ignorando");
+        return;
+    }
+
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+
+        var charId = await ResolveDeleteCharacterIdAsync(connection, session.UserGameId, packet.Payload, token);
+        if (charId == 0)
+        {
+            Console.WriteLine($"CHARDELETE #{sessionId}: no se pudo resolver personaje payload={HexPreview(packet.Payload)}");
+            await SendPacketAsync(sessionId, stream, 0x0013, new byte[] { 0x01 }, token, "CharacterDelete error");
+            return;
+        }
+
+        string charName;
+        ushort level;
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT name,level FROM characterinfo WHERE id=@cid AND userid=@uid AND IFNULL(auth,0)<>10 LIMIT 1";
+            cmd.Parameters.AddWithValue("@cid", charId);
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                await SendPacketAsync(sessionId, stream, 0x0013, new byte[] { 0x01 }, token, "CharacterDelete no encontrado");
+                return;
+            }
+            charName = reader.GetString(0);
+            level = Convert.ToUInt16(reader[1]);
+        }
+
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "UPDATE characterinfo SET used=0, auth=10, changetime=now() WHERE id=@cid AND userid=@uid";
+            cmd.Parameters.AddWithValue("@cid", charId);
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            await cmd.ExecuteNonQueryAsync(token);
+        }
+
+        await TryLogDeletedCharacterAsync(connection, session.UserGameId, charName, level, token);
+
+        Console.WriteLine($"CHARDELETE #{sessionId}: borrado charId={charId} name='{charName}'");
+        await SendPacketAsync(sessionId, stream, 0x0013, BuildCharacterDeleteResponse(0x00, charId), token, "CharacterDelete success");
+        await RefreshCharactersAsync(config, sessionId, stream, session, token, "CharacterDelete refresh");
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"CHARDELETE #{sessionId}: DB ERROR {ex.Message}");
+        await SendPacketAsync(sessionId, stream, 0x0013, new byte[] { 0x01 }, token, "CharacterDelete DB error");
+    }
+}
+
+static async Task HandleCharacterSelectAsync(WorldServerConfig config, int sessionId, NetworkStream stream, RakionClientPacket packet, ConcurrentDictionary<int, LoginSession> loginSessions, CancellationToken token)
+{
+    if (!loginSessions.TryGetValue(sessionId, out var session))
+    {
+        Console.WriteLine($"CHARSELECT #{sessionId}: sesion no encontrada, ignorando");
+        return;
+    }
+
+    var selPayload = packet.Payload;
+    if (selPayload.Length < 6)
+    {
+        var padded = new byte[6];
+        selPayload.CopyTo(padded, 0);
+        selPayload = padded;
+    }
+
+    var charId = BinaryPrimitives.ReadUInt32LittleEndian(selPayload);
+    Console.WriteLine($"CHARSELECT #{sessionId}: userId={session.UserGameId} charId={charId}");
+
+    try
+    {
+        await using var connection = new MySqlConnection(BuildConnectionString(config));
+        await connection.OpenAsync(token);
+
+        CharInfo? ch = null;
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT slot,id,name,IFNULL(auth,0),IFNULL(class,0),IFNULL(level,1),IFNULL(exp,0),IFNULL(levelpoint,0)," +
+                              "IFNULL(hit1,0),IFNULL(hit2,0),IFNULL(hit3,0),IFNULL(hit4,0),IFNULL(chit,0),IFNULL(hp,0),IFNULL(ap,0)," +
+                              "IFNULL(attackspeed,0),IFNULL(speed,0),IFNULL(maxcp,0),IFNULL(rankgrade,0),IFNULL(win,0),IFNULL(lose,0)," +
+                              "IFNULL(draw,0),IFNULL(totalrank,0),IFNULL(classrank,0),IFNULL(potionslot,0) " +
+                              "FROM CharacterInfo WHERE id=@cid AND userid=@uid AND IFNULL(auth,0)<>10 LIMIT 1";
+            cmd.Parameters.AddWithValue("@cid", charId);
+            cmd.Parameters.AddWithValue("@uid", session.UserGameId);
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (await reader.ReadAsync(token))
+            {
+                ch = new CharInfo(
+                    Convert.ToUInt32(reader[1]), reader.GetString(2),
+                    Convert.ToByte(reader[0]), Convert.ToByte(reader[4]),
+                    Convert.ToUInt16(reader[5]), Convert.ToUInt32(reader[6]),
+                    Convert.ToUInt16(reader[7]), Convert.ToUInt16(reader[18]),
+                    Convert.ToUInt32(reader[19]), Convert.ToUInt32(reader[20]),
+                    Convert.ToUInt32(reader[21]), Convert.ToUInt16(reader[8]),
+                    Convert.ToUInt16(reader[9]), Convert.ToUInt16(reader[10]),
+                    Convert.ToUInt16(reader[11]), Convert.ToUInt16(reader[12]),
+                    Convert.ToUInt16(reader[13]), Convert.ToUInt16(reader[14]),
+                    Convert.ToUInt16(reader[15]), Convert.ToUInt16(reader[16]),
+                    Convert.ToUInt16(reader[17]), Convert.ToUInt32(reader[22]),
+                    Convert.ToUInt32(reader[23]), Convert.ToByte(reader[24]));
+            }
+        }
+
+        if (ch == null)
+        {
+            Console.WriteLine($"CHARSELECT #{sessionId}: personaje {charId} no encontrado");
+            await SendPacketAsync(sessionId, stream, 0x0014, new byte[] { 0x01 }, token, "CharacterSelect error");
+            return;
+        }
+
+        Console.WriteLine($"CHARSELECT #{sessionId}: nombre='{ch.Name}' nivel={ch.Level} clase={ch.Class}");
+        await SendPacketAsync(sessionId, stream, 0x0014, new byte[] { 0x00 }, token, "CharacterSelect Success");
+        await SendPacketAsync(sessionId, stream, 0x001F, BuildChannelEnter((ushort)sessionId, ch), token, "ChannelEnter");
+        await SendPacketAsync(sessionId, stream, 0x001E, BuildChannelCharacterState((ushort)sessionId, ch), token, "ChannelCharacterState");
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"CHARSELECT #{sessionId}: DB ERROR {ex.Message}");
+    }
+}
+
+// ==================== SEND HELPERS ====================
+
+static async Task SendPacketAsync(int sessionId, NetworkStream stream, ushort opcode, ReadOnlyMemory<byte> payload, CancellationToken token, string? note = null)
+{
+    var frame = RakionPacketCodec.EncodeServerFrame(opcode, payload.Span);
+    await stream.WriteAsync(frame, token);
+    var suffix = string.IsNullOrWhiteSpace(note) ? string.Empty : $" {note}";
+    Console.WriteLine($"TCP TX #{sessionId}: cmd=0x{opcode:X4} {OpcodeName(opcode)}{suffix} payload={payload.Length} frame={frame.Length}");
+}
+
+static async Task SendLoginErrorAsync(int sessionId, NetworkStream stream, byte errorCode, CancellationToken token)
+{
+    await SendPacketAsync(sessionId, stream, 0x000C, new byte[] { errorCode }, token, $"LoginError code=0x{errorCode:X2}");
+}
+
+static async Task SendLoginSuccessAsync(WorldServerConfig config, int sessionId, NetworkStream stream, int userGameId, int sessionIndex, int gold, int cash, byte slotCount, byte bagCount, List<CharInfo> characters, CancellationToken token)
+{
+    var prelude = BuildLoginPrelude(config, userGameId, sessionIndex, gold, cash, slotCount, bagCount, characters);
+    var charBlock = BuildLoginCharacterBlock(slotCount, characters);
+
+    var frame0C = RakionPacketCodec.EncodeServerFrame(0x000C, prelude, minPlainLength: 84);
+    var frame0D = RakionPacketCodec.EncodeServerFrame(0x000D, charBlock, minPlainLength: 1332);
+    var batch = new byte[frame0C.Length + frame0D.Length];
+    frame0C.CopyTo(batch, 0);
+    frame0D.CopyTo(batch, frame0C.Length);
+    await stream.WriteAsync(batch, token);
+    Console.WriteLine($"TCP TX #{sessionId}: BATCH 0x000C+0x000D frame0C={frame0C.Length} frame0D={frame0D.Length} total={batch.Length}");
+}
+
+static async Task SendLobbyInfoPackets(WorldServerConfig config, int sessionId, NetworkStream stream, uint userId, CancellationToken token, string tag)
+{
+    await SendPacketAsync(sessionId, stream, 0x000E, BuildLobbyServerInfo(config.Bind, 9), token, $"LobbyServerInfo {tag}");
+    await SendPacketAsync(sessionId, stream, 0x0010, BuildLobbyUnknown10(config.Bind, userId), token, $"LobbyUnknown10 {tag}");
+}
+
+static void ScheduleLobbyFallback(WorldServerConfig config, int sessionId, NetworkStream stream, LoginSession session)
+{
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            if (session.LobbyInfoSent) return;
+            session.LobbyInfoSent = true;
+            await SendLobbyInfoPackets(config, sessionId, stream, session.UserGameId, CancellationToken.None, "fallback");
+        }
+        catch (Exception) { }
+    });
+}
+
+static async Task RefreshCharactersAsync(WorldServerConfig config, int sessionId, NetworkStream stream, LoginSession session, CancellationToken token, string note)
+{
+    await using var connection = new MySqlConnection(BuildConnectionString(config));
+    await connection.OpenAsync(token);
+    var characters = await QueryCharactersAsync(connection, session.UserGameId, token);
+    await SendLoginSuccessAsync(config, sessionId, stream, (int)session.UserGameId, sessionId, session.Gold, session.Cash, session.SlotCount, session.BagCount, characters, token);
+    Console.WriteLine($"{note} #{sessionId}: {characters.Count} character(s) reenviados");
+}
+
+// ==================== DB HELPERS ====================
+
+static async Task<uint> ResolveDeleteCharacterIdAsync(MySqlConnection connection, uint userId, byte[] payload, CancellationToken token)
+{
+    if (payload.Length >= 4)
+    {
+        var charId = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        if (await CharacterExistsAsync(connection, userId, charId, token)) return charId;
+    }
+
+    if (payload.Length >= 1)
+    {
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM characterinfo WHERE userid=@uid AND slot=@slot AND IFNULL(auth,0)<>10 LIMIT 1";
+        cmd.Parameters.AddWithValue("@uid", userId);
+        cmd.Parameters.AddWithValue("@slot", payload[0]);
+        var value = await cmd.ExecuteScalarAsync(token);
+        if (value != null && value != DBNull.Value) return Convert.ToUInt32(value);
+    }
+
+    return 0;
+}
+
+static async Task<bool> CharacterExistsAsync(MySqlConnection connection, uint userId, uint charId, CancellationToken token)
+{
+    await using var cmd = connection.CreateCommand();
+    cmd.CommandText = "SELECT 1 FROM characterinfo WHERE id=@cid AND userid=@uid AND IFNULL(auth,0)<>10 LIMIT 1";
+    cmd.Parameters.AddWithValue("@cid", charId);
+    cmd.Parameters.AddWithValue("@uid", userId);
+    var value = await cmd.ExecuteScalarAsync(token);
+    return value != null && value != DBNull.Value;
+}
+
+static async Task TryLogDeletedCharacterAsync(MySqlConnection connection, uint userId, string charName, ushort level, CancellationToken token)
+{
+    try
+    {
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "INSERT INTO LogDeleteCharacter (userid,charname,deletetime,level) VALUES (@uid,@name,now(),@level)";
+        cmd.Parameters.AddWithValue("@uid", userId);
+        cmd.Parameters.AddWithValue("@name", charName);
+        cmd.Parameters.AddWithValue("@level", level);
+        await cmd.ExecuteNonQueryAsync(token);
+    }
+    catch (MySqlException ex)
+    {
+        Console.WriteLine($"CHARDELETE: no se pudo escribir LogDeleteCharacter: {ex.Message}");
+    }
+}
+
+// ==================== PACKET BUILDERS ====================
+
+static byte[] BuildLoginPrelude(WorldServerConfig config, int userGameId, int sessionIndex, int gold, int cash, byte slotCount, byte bagCount, List<CharInfo> characters)
+{
+    var effectiveSlot = NormalizeSlotCount(slotCount, characters);
+    var effectiveBag = bagCount < 1 ? (byte)1 : bagCount;
+    var serverMinute = (uint)(DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60);
+    var udpToken = ComputeUdpToken(config.Bind);
+
+    var header = new byte[62];
+    header[0] = 0x00;
+    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(1), (uint)userGameId);
+    BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(5), (ushort)sessionIndex);
+    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(7), udpToken);
+    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(11), serverMinute);
+    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(52), (uint)gold);
+    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(56), (uint)cash);
+    header[60] = effectiveSlot;
+    header[61] = effectiveBag;
+
+    using var ms = new MemoryStream();
+    ms.Write(header);
+
+    var bySlot = characters
+        .Where(c => c.Slot < 4)
+        .GroupBy(c => c.Slot)
+        .ToDictionary(g => g.Key, g => g.First());
+
+    var firstBlockSlots = Math.Min(effectiveSlot, (byte)4);
+    for (byte slot = 0; slot < firstBlockSlots; slot++)
+    {
+        if (bySlot.TryGetValue(slot, out var ch))
+            WriteCharacterRecord(ms, ch);
+        else
+            ms.Write(new byte[4]);
+    }
+
+    return ms.ToArray();
+}
+
+static byte[] BuildLoginCharacterBlock(byte slotCount, List<CharInfo> characters)
+{
+    var effectiveSlot = NormalizeSlotCount(slotCount, characters);
+    using var ms = new MemoryStream();
+
+    var bySlot = characters
+        .Where(c => c.Slot >= 4 && c.Slot < effectiveSlot)
+        .GroupBy(c => c.Slot)
+        .ToDictionary(g => g.Key, g => g.First());
+
+    for (byte slot = 4; slot < effectiveSlot; slot++)
+    {
+        if (bySlot.TryGetValue(slot, out var ch))
+            WriteCharacterRecord(ms, ch);
+        else
+            ms.Write(new byte[4]);
+    }
+
+    ms.WriteByte(0x00);
+    ms.WriteByte(0x01);
+    while (ms.Length < 1330) ms.WriteByte(0);
+
+    return ms.ToArray();
+}
+
+static void WriteCharacterRecord(MemoryStream ms, CharInfo ch)
+{
+    var cls = ch.Class > 15 ? (byte)0 : ch.Class;
+    var level = ch.Level < 1 ? (ushort)1 : ch.Level;
+    var levelByte = level > 255 ? (byte)255 : (byte)level;
+
+    Write4(ms, ch.Id);
+    WriteCString(ms, ch.Name);
+
+    // El servidor original escribe exactamente 0x168 (360) bytes de datos estáticos a la red
+    var startPos = ms.Position;
+
+    Write4(ms, ch.Losses);     // 0x00: 4 bytes
+    Write4(ms, ch.Draws);      // 0x04: 4 bytes
+    Write4(ms, 0);             // 0x08: 4 bytes
+    
+    ms.WriteByte((byte)Math.Min(255u, ch.ClassRank)); // 0x0C: 1 byte
+    
+    Write4(ms, ch.TotalRank);  // 0x0D: 4 bytes
+    Write4(ms, ch.Experience); // 0x11: 4 bytes
+    
+    ms.WriteByte(0);           // 0x15: 1 byte (Auth/Face)
+    ms.WriteByte(cls);         // 0x16: 1 byte
+    ms.WriteByte(levelByte);   // 0x17: 1 byte
+    
+    Write4(ms, ch.RankGrade);  // 0x18: 4 bytes
+    
+    // 0x1C: 11 ushorts (22 bytes) -> ends at 0x32
+    Write2(ms, ch.Hit1);
+    Write2(ms, ch.Hit2);
+    Write2(ms, ch.Hit3);
+    Write2(ms, ch.Hit4);
+    Write2(ms, ch.CriticalHit);
+    Write2(ms, ch.Hp);
+    Write2(ms, ch.Ap);
+    Write2(ms, ch.AttackSpeed);
+    Write2(ms, ch.Speed);
+    Write2(ms, ch.MaxCp);
+    Write2(ms, ch.LevelPoint);
+    
+    // 0x32: 38 bytes (19 ushorts) -> Aquí van los IDs de ítems para mostrarlos visualmente en la selección -> ends at 0x58
+    for (var i = 0; i < 19; i++) Write2(ms, (ushort)(ch.Items[i]?.ItemId ?? 0));
+    
+    // 0x58: 19 bytes (config/stage bits) -> Tiempo Límite del ítem -> ends at 0x6B
+    for (var i = 0; i < 19; i++) ms.WriteByte(ch.Items[i]?.LimitTime ?? 0);
+    
+    // 0x6B: 76 bytes (19 dwords) -> Equip Items (IDs únicos en BD) -> ends at 0xB7
+    for (var i = 0; i < 19; i++) Write4(ms, ch.Items[i]?.DbId ?? 0);
+    
+    // 0xB7: 76 bytes (19 dwords) -> Experiencia del ítem/cría -> ends at 0x103
+    for (var i = 0; i < 19; i++) Write4(ms, ch.Items[i]?.Exp ?? 0);
+    
+    // 0x103: 100 bytes (25 dwords) -> Niveles de ítems (19) + 6 dwords de padding -> ends at 0x167
+    for (var i = 0; i < 19; i++) Write4(ms, ch.Items[i]?.Level ?? 0);
+    for (var i = 0; i < 6; i++) Write4(ms, 0); // Padding para completar los 25
+    
+    // 0x167: 1 byte -> Potion Slot!
+    ms.WriteByte(ch.PotionSlot);
+
+    var endPos = ms.Position;
+    if (endPos - startPos != 0x168) {
+        Console.WriteLine($"WARNING: WriteCharacterRecord size mismatch. Expected {0x168}, got {endPos - startPos}");
+    }
+}
+
+static byte[] BuildLobbyServerInfo(string bindAddress, byte country)
+{
+    var ipToken = ComputeUdpToken(bindAddress);
+    var marker = (ushort)(0x1200 | (country & 0xFF));
+    var payload = new byte[13];
+    payload[0] = 0x00;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), ipToken);
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(5), marker);
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(7), ipToken);
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(11), marker);
+    return payload;
+}
+
+static byte[] BuildLobbyUnknown10(string bindAddress, uint userId)
+{
+    var ipToken = ComputeUdpToken(bindAddress);
+    var tick = unchecked((uint)Environment.TickCount);
+    var payload = new byte[16];
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0), tick ^ ipToken);
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), ipToken);
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), userId);
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), tick ^ ipToken ^ userId);
+    return payload;
+}
+
+static byte[] BuildCharacterCreateResponse(byte result, uint charId, byte slot, byte charClass)
+{
+    var payload = new byte[8];
+    payload[0] = result;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), charId);
+    payload[5] = slot;
+    payload[6] = charClass;
+    payload[7] = 0x07;
+    return payload;
+}
+
+static byte[] BuildCharacterDeleteResponse(byte result, uint charId)
+{
+    var payload = new byte[5];
+    payload[0] = result;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), charId);
+    return payload;
+}
+
+static byte[] BuildChannelEnter(ushort sessionIndex, CharInfo ch)
+{
+    var payload = new byte[18];
+    payload[0] = 0x00;
+    payload[1] = 0x00;
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(2), sessionIndex);
+    WriteCStrToSpan(payload.AsSpan(4), ch.Name, 13);
+    payload[17] = 0x01;
+    return payload;
+}
+
+static byte[] BuildChannelCharacterState(ushort sessionIndex, CharInfo ch)
+{
+    var payload = new byte[45];
+    var off = 0;
+    payload[off++] = 0x00;
+    payload[off++] = 0x01;
+    WriteCStrToSpan(payload.AsSpan(off), "dchannel01", 13); off += 13;
+    payload[off++] = 0x00;
+    payload[off++] = 0x00;
+    BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(off), sessionIndex); off += 2;
+    WriteCStrToSpan(payload.AsSpan(off), ch.Name, 13); off += 13;
+    payload[off++] = 0x01;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(off), ch.Level); off += 4;
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(off), ch.Class); off += 4;
+    return payload;
+}
+
+static byte[] BuildCharacterNameEcho(byte result, string name)
+{
+    var payload = new byte[27];
+    payload[0] = result;
+    WriteCStrToSpan(payload.AsSpan(1), name, 13);
+    WriteCStrToSpan(payload.AsSpan(14), name, 13);
+    return payload;
+}
+
+// ==================== STRING / PARSE HELPERS ====================
+
+static string ExtractUsernameFromPayload(ReadOnlySpan<byte> payload)
+{
+    if (payload.Length < 4) return string.Empty;
+    var start = 3;
+    var end = start;
+    while (end < payload.Length && payload[end] != 0 && payload[end] >= 0x20 && payload[end] <= 0x7E)
+        end++;
+    if (end <= start) return string.Empty;
+    return Encoding.ASCII.GetString(payload[start..end]).Trim();
+}
+
+static string ParseFixedString(ReadOnlySpan<byte> data, int offset, int maxLen)
+{
+    if (data.Length <= offset) return string.Empty;
+    var available = Math.Min(maxLen, data.Length - offset);
+    var slice = data.Slice(offset, available);
+    var nullIdx = slice.IndexOf((byte)0);
+    if (nullIdx >= 0) slice = slice[..nullIdx];
+    return Encoding.ASCII.GetString(slice).Trim();
+}
+
+static void ParseCharacterClassAndSlot(ReadOnlySpan<byte> payload, out byte charClass, out byte slot)
+{
+    var nullOffset = payload.IndexOf((byte)0);
+    if (nullOffset >= 0 && nullOffset + 2 < payload.Length)
+    {
+        charClass = payload[nullOffset + 1];
+        slot = payload[nullOffset + 2];
+    }
+    else
+    {
+        charClass = 0;
+        slot = 0;
+    }
+}
+
+static bool IsValidCharacterName(string name)
+{
+    if (name.Length is < 3 or > 12) return false;
+    foreach (var c in name)
+    {
+        if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
+// ==================== BINARY WRITE HELPERS ====================
+
+static byte NormalizeSlotCount(byte slotCount, List<CharInfo> characters)
+{
+    var neededSlots = characters.Count == 0 ? 0 : characters.Max(c => (int)c.Slot) + 1;
+    return (byte)Math.Clamp(Math.Max(slotCount, neededSlots), 3, 6);
+}
+
+static uint ComputeUdpToken(string bindAddress)
+{
+    if (!IPAddress.TryParse(bindAddress, out var addr)) return 0;
+    var bytes = addr.GetAddressBytes();
+    return bytes.Length == 4 ? BinaryPrimitives.ReadUInt32LittleEndian(bytes) : 0;
+}
+
+static void Write2(MemoryStream ms, ushort value)
+{
+    ms.WriteByte((byte)(value & 0xFF));
+    ms.WriteByte((byte)(value >> 8));
+}
+
+static void Write4(MemoryStream ms, uint value)
+{
+    ms.WriteByte((byte)(value & 0xFF));
+    ms.WriteByte((byte)((value >> 8) & 0xFF));
+    ms.WriteByte((byte)((value >> 16) & 0xFF));
+    ms.WriteByte((byte)(value >> 24));
+}
+
+static void WriteCString(MemoryStream ms, string value)
+{
+    var bytes = Encoding.ASCII.GetBytes(value);
+    ms.Write(bytes, 0, bytes.Length);
+    ms.WriteByte(0);
+}
+
+static void WriteCStrToSpan(Span<byte> dest, string value, int fixedBytes)
+{
+    var bytes = Encoding.ASCII.GetBytes(value);
+    var count = Math.Min(bytes.Length, fixedBytes - 1);
+    bytes.AsSpan(0, count).CopyTo(dest);
+    if (count < dest.Length)
+        dest[count] = 0;
+}
+
+static string HexPreview(ReadOnlySpan<byte> data)
+{
+    var previewLength = Math.Min(data.Length, 96);
+    var suffix = data.Length > previewLength ? "..." : string.Empty;
+    return Convert.ToHexString(data[..previewLength]) + suffix;
+}
+
+static string OpcodeName(ushort opcode)
+{
+    return opcode switch
+    {
+        0x0001 => "InitialCheck",
+        0x0002 => "ServerInfoAndMd5",
+        0x000B => "ClientMd5Echo",
+        0x000C => "Login",
+        0x000D => "LoginCharacterBlock",
+        0x000E => "LobbyServerInfo",
+        0x000F => "KeepAliveLatency",
+        0x0010 => "GameGuardCheck",
+        0x0012 => "CharacterCreate",
+        0x0013 => "CharacterDelete",
+        0x0014 => "CharacterSelect",
+        0x0015 => "CharacterNameEcho",
+        0x001E => "ChannelCharacterState",
+        0x001F => "ChannelEnter",
+        0x002C => "InventoryEnter",
+        0x002D => "InventoryLeave",
+        0x0036 => "FieldList",
+        0x0038 => "FieldEnter",
+        0x0039 => "QuickEnter",
+        0x003A => "FieldLeave",
+        0x003B => "FieldCreate",
+        0x003D => "FieldReady",
+        0x0043 => "FieldStartRequest",
+        0x0047 => "FieldChat",
+        0x004F => "BattleDeathReport",
+        0x0061 => "KeepAliveOrVersion",
+        0x0062 => "FieldSlotUdp",
+        _ => "Unknown"
+    };
+}
+
+// IPC removido
+
+// ==================== PACKET CODEC ====================
+
+record EquipItem(uint DbId, int ItemId, uint Level, uint Exp, byte LimitTime);
+
+record CharInfo(
+    uint Id, string Name, byte Slot, byte Class,
+    ushort Level, uint Experience, ushort LevelPoint, ushort RankGrade,
+    uint Wins, uint Losses, uint Draws,
+    ushort Hit1, ushort Hit2, ushort Hit3, ushort Hit4, ushort CriticalHit,
+    ushort Hp, ushort Ap, ushort AttackSpeed, ushort Speed, ushort MaxCp,
+    uint TotalRank, uint ClassRank, byte PotionSlot)
+{
+    public EquipItem[] Items { get; } = new EquipItem[19];
+}
+
+sealed class LoginSession
+{
+    public uint UserGameId { get; }
+    public string Username { get; }
+    public int Gold { get; }
+    public int Cash { get; }
+    public byte SlotCount { get; }
+    public byte BagCount { get; }
+    public volatile bool LobbyInfoSent;
+    private int _inventoryOpenCount = 4;
+
+    public LoginSession(uint userGameId, string username, int gold, int cash, byte slotCount, byte bagCount)
+    {
+        UserGameId = userGameId;
+        Username = username;
+        Gold = gold;
+        Cash = cash;
+        SlotCount = slotCount;
+        BagCount = bagCount;
+    }
+
+    public byte NextInventoryOpenCount() =>
+        (byte)Math.Min(Interlocked.Increment(ref _inventoryOpenCount), 255);
+}
+
+readonly record struct RakionClientPacket(ushort Opcode, ushort Sequence, byte[] Payload);
+
+static class RakionPacketCodec
+{
+    private static readonly byte[] StaticAesKey =
+    [
+        0xE1, 0x3A, 0x7E, 0xF5,
+        0x37, 0x2C, 0x10, 0x4D,
+        0x4E, 0xCE, 0xB3, 0x0C,
+        0x56, 0x26, 0xA4, 0x8E
+    ];
+
+    public static bool TryDecodeClientFrame(ReadOnlySpan<byte> frame, out RakionClientPacket packet, out string error)
+    {
+        packet = default;
+        error = string.Empty;
+
+        if (frame.Length < 6)
+        {
+            error = "frame menor que [len:2][cmd:2][seq:2]";
+            return false;
+        }
+
+        var body = frame[2..];
+        var plain = DecodeRakionBlocks(body);
+        if (plain.Length < 4)
+        {
+            error = "plain menor que [cmd:2][seq:2]";
+            return false;
+        }
+
+        var opcode = BinaryPrimitives.ReadUInt16LittleEndian(plain);
+        var sequence = BinaryPrimitives.ReadUInt16LittleEndian(plain[2..]);
+        var payload = TrimPadding(plain[4..]).ToArray();
+        packet = new RakionClientPacket(opcode, sequence, payload);
+        return true;
+    }
+
+    public static byte[] EncodeServerFrame(ushort opcode, ReadOnlySpan<byte> payload, ushort? sequence = null, int minPlainLength = 0)
+    {
+        var headerLength = sequence.HasValue ? 4 : 2;
+        var plainLength = Math.Max(headerLength + payload.Length, minPlainLength);
+        var blockCount = Math.Max(1, (plainLength + 11) / 12);
+        var paddedPlain = new byte[blockCount * 12];
+        var cursor = 0;
+        if (sequence is { } sequenceValue)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(paddedPlain.AsSpan(cursor), sequenceValue);
+            cursor += 2;
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(paddedPlain.AsSpan(cursor), opcode);
+        cursor += 2;
+        payload.CopyTo(paddedPlain.AsSpan(cursor));
+
+        var encrypted = EncodeRakionBlocks(paddedPlain);
+        var frame = new byte[encrypted.Length + 2];
+        BinaryPrimitives.WriteUInt16LittleEndian(frame, checked((ushort)frame.Length));
+        encrypted.CopyTo(frame.AsSpan(2));
+        return frame;
+    }
+
+    private static byte[] DecodeRakionBlocks(ReadOnlySpan<byte> encrypted)
+    {
+        if (encrypted.Length == 0)
+        {
+            return [];
+        }
+
+        if (encrypted.Length % 16 != 0)
+        {
+            Console.WriteLine($"WARNING: DecodeRakionBlocks received {encrypted.Length} bytes (not multiple of 16), treating as plaintext");
+            return encrypted.ToArray();
+        }
+
+        var output = new byte[encrypted.Length / 16 * 12];
+        using var aes = Aes.Create();
+        aes.Key = StaticAesKey;
+        aes.Mode = CipherMode.ECB;
+        aes.Padding = PaddingMode.None;
+        using var decryptor = aes.CreateDecryptor();
+
+        var decrypted = new byte[16];
+        for (var i = 0; i < encrypted.Length / 16; i++)
+        {
+            decryptor.TransformBlock(encrypted.Slice(i * 16, 16).ToArray(), 0, 16, decrypted, 0);
+            decrypted.AsSpan(4, 12).CopyTo(output.AsSpan(i * 12));
+        }
+
+        return output;
+    }
+
+    private static byte[] EncodeRakionBlocks(ReadOnlySpan<byte> plain)
+    {
+        var blockCount = Math.Max(1, (plain.Length + 11) / 12);
+        var output = new byte[blockCount * 16];
+
+        using var aes = Aes.Create();
+        aes.Key = StaticAesKey;
+        aes.Mode = CipherMode.ECB;
+        aes.Padding = PaddingMode.None;
+        using var encryptor = aes.CreateEncryptor();
+
+        Span<byte> block = stackalloc byte[16];
+        var encrypted = new byte[16];
+        for (var i = 0; i < blockCount; i++)
+        {
+            block.Clear();
+            block[0] = 0x7F;
+            block[1] = 0xC4;
+            var sourceOffset = i * 12;
+            var count = Math.Min(12, plain.Length - sourceOffset);
+            if (count > 0)
+            {
+                plain.Slice(sourceOffset, count).CopyTo(block[4..]);
+            }
+
+            encryptor.TransformBlock(block.ToArray(), 0, 16, encrypted, 0);
+            encrypted.CopyTo(output.AsSpan(i * 16));
+        }
+
+        return output;
+    }
+
+    private static ReadOnlySpan<byte> TrimPadding(ReadOnlySpan<byte> data)
+    {
+        var length = data.Length;
+        while (length > 0 && data[length - 1] == 0)
+        {
+            length--;
+        }
+
+        return data[..length];
+    }
+}
+
+// ==================== CONFIG ====================
+
+sealed class WorldServerConfig
+{
+    public required string Bind { get; init; }
+    public required int Port { get; init; }
+    public required int ServerId { get; init; }
+    public required int MaxUser { get; init; }
+    public required int MaxField { get; init; }
+    public required string BrokerIp { get; init; }
+    public required int BrokerPort { get; init; }
+    public required string DatabaseHost { get; init; }
+    public required int DatabasePort { get; init; }
+    public required string DatabaseUser { get; init; }
+    public required string DatabasePassword { get; init; }
+    public required string DatabaseName { get; init; }
+    public required int UdpPort1 { get; init; }
+    public required int UdpPort2 { get; init; }
+    public required string Md5TokenA { get; init; }
+    public required string Md5TokenB { get; init; }
+
+    public static WorldServerConfig Load(string path)
+    {
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"WARN: Config file not found at {path}, using defaults.");
+        }
+
+        var ini = IniFile.Load(path);
+        return new WorldServerConfig
+        {
+            Bind = ini.Get("Server", "Bind", "192.168.1.69"),
+            Port = ini.GetInt("Server", "Port", 40708),
+            ServerId = ini.GetInt("Server", "ServerId", 1),
+            MaxUser = ini.GetInt("Server", "MaxUser", 1000),
+            MaxField = ini.GetInt("Server", "MaxField", 2000),
+            BrokerIp = ini.Get("Broker", "IP", "127.0.0.1"),
+            BrokerPort = ini.GetInt("Broker", "Port", 40706),
+            DatabaseHost = ini.Get("DB", "IP", "127.0.0.1"),
+            DatabasePort = ini.GetInt("DB", "Port", 3306),
+            DatabaseUser = ini.Get("DB", "User", "root"),
+            DatabasePassword = ini.Get("DB", "Pass", "123456"),
+            DatabaseName = ini.Get("DB", "Name", "rakion"),
+            UdpPort1 = ini.GetInt("UDP", "Port1", 40708),
+            UdpPort2 = ini.GetInt("UDP", "Port2", 40709),
+            Md5TokenA = ini.Get("Client", "MD5_1", "D"),
+            Md5TokenB = ini.Get("Client", "MD5_2", "709F1058DC30EB19761F55C82104D235")
+        };
+    }
+}
+
+sealed class IniFile
+{
+    private readonly Dictionary<string, Dictionary<string, string>> sections = new(StringComparer.OrdinalIgnoreCase);
+
+    public string Get(string section, string key, string fallback)
+    {
+        return sections.TryGetValue(section, out var values) && values.TryGetValue(key, out var value)
+            ? value
+            : fallback;
+    }
+
+    public int GetInt(string section, string key, int fallback)
+    {
+        return int.TryParse(Get(section, key, fallback.ToString()), out var value) ? value : fallback;
+    }
+
+    public static IniFile Load(string path)
+    {
+        var ini = new IniFile();
+        if (!File.Exists(path)) return ini;
+
+        var currentSection = string.Empty;
+
+        foreach (var rawLine in File.ReadAllLines(path))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith(';') || line.StartsWith('#'))
+                continue;
+
+            if (line.StartsWith('[') && line.EndsWith(']'))
+            {
+                currentSection = line[1..^1].Trim();
+                ini.sections.TryAdd(currentSection, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+                continue;
+            }
+
+            var separator = line.IndexOf('=');
+            if (separator <= 0) continue;
+
+            var key = line[..separator].Trim();
+            var val = line[(separator + 1)..].Trim();
+            if (!ini.sections.TryGetValue(currentSection, out var values))
+            {
+                values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                ini.sections[currentSection] = values;
+            }
+
+            values[key] = val;
+        }
+
+        return ini;
+    }
+}
